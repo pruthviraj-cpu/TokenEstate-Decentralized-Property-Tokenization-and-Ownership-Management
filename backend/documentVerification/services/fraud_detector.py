@@ -40,8 +40,9 @@ RENDER_DPI = 150
 MAX_PAGES = 50            # DoS guard for text extraction
 MAX_OCR_PAGES = 3         # OCR page 1 always, plus sparse pages up to this count
 DIGITAL_TEXT_MIN_CHARS = 200
-ELA_PIXEL_THRESHOLD = 35
-ELA_ANOMALY_RATIO = 0.015
+ELA_BLOCK = 32                 # analyse the page in 32x32 pixel blocks
+ELA_BLOCK_ERROR = 3.0          # a block is 'hot' if its mean re-compression error exceeds this
+ELA_ANOMALY_RATIO = 0.002      # reject-worthy if more than 0.2% of blocks are hot (~4 blocks on A4@150dpi)
 GEMINI_MODEL = "gemini-2.5-flash"
 GEMINI_MAX_BYTES = 15 * 1024 * 1024
 CLIP_MODEL_ID = "openai/clip-vit-base-patch32"
@@ -101,22 +102,49 @@ def _survey_present(expected: str, text: str) -> bool:
     return _alnum(expected) in _alnum(text)
 
 
-def _owner_present(expected: str, text: str, min_ratio: float = 0.85) -> bool:
+def _fuzzy_in_collapsed(tok: str, collapsed: str, min_ratio: float) -> bool:
+    n = len(tok)
+    text = collapsed[:20000]
+    for i in range(0, max(len(text) - n + 1, 0)):
+        if SequenceMatcher(None, tok, text[i:i + n]).ratio() >= min_ratio:
+            return True
+    return False
+
+
+def _owner_present(expected: str, text: str, min_ratio: float = 0.80) -> bool:
     """
-    Token-based fuzzy match so word order ('Deshmukh Aarav') and small OCR
-    errors ('Aarov') don't cause false rejections. Every name token must match.
+    Name match that survives OCR quirks. RapidOCR often drops spaces ('SunitaRameshKulkarni'),
+    so we also search a space-less copy of the text. Short tokens ('More') must sit right next
+    to a longer matched token, so 'more' inside 'moreover' does not count. Small typos are
+    tolerated with fuzzy matching. Every name token must be found.
     """
     tokens = [t for t in re.findall(r"[a-z0-9]+", expected.lower()) if len(t) > 1]
     if not tokens:
         return True
     words = set(re.findall(r"[a-z0-9]+", text.lower()))
-    if not words:
+    collapsed = _alnum(text)
+    if not collapsed:
         return False
+
+    anchors = []
+    for t in (t for t in tokens if len(t) > 4):
+        anchors += [m.start() for m in re.finditer(re.escape(t), collapsed)]
+
+    def near_anchor(tok):
+        return any(abs(m.start() - a) <= 30 for m in re.finditer(re.escape(tok), collapsed) for a in anchors)
+
     for tok in tokens:
         if tok in words:
             continue
-        if not any(SequenceMatcher(None, tok, w).ratio() >= min_ratio for w in words):
-            return False
+        if len(tok) > 4 and tok in collapsed:
+            continue
+        if len(tok) <= 4 and anchors and near_anchor(tok):
+            continue
+        if any(SequenceMatcher(None, tok, w).ratio() >= min_ratio for w in words):
+            continue
+        if len(tok) > 4 and _fuzzy_in_collapsed(tok, collapsed, min_ratio):
+            continue
+        return False
     return True
 
 
@@ -181,12 +209,23 @@ def extract_text_with_ocr_fallback(doc: "pymupdf.Document", page_image: Optional
 # Layer 2: ELA
 # ----------------------------------------------------------------------------
 def run_ela(img: Image.Image) -> float:
+    """
+    Block-wise Error Level Analysis. Re-save the page as 90% JPEG and measure, per 32x32 block,
+    how much each block changes. Untouched areas of a scan change little; digitally pasted or
+    retyped areas (compressed fewer times) change a lot. Returns the fraction of 'hot' blocks.
+    """
     buf = io.BytesIO()
     img.save(buf, "JPEG", quality=90)
     buf.seek(0)
     resaved = Image.open(buf).convert("RGB")
-    diff = np.array(ImageChops.difference(img, resaved)).max(axis=2)  # worst channel per pixel
-    return float(np.mean(diff > ELA_PIXEL_THRESHOLD))
+    diff = np.array(ImageChops.difference(img, resaved)).max(axis=2).astype(np.float32)
+    h, w = diff.shape
+    h -= h % ELA_BLOCK
+    w -= w % ELA_BLOCK
+    if h == 0 or w == 0:
+        return 0.0
+    blocks = diff[:h, :w].reshape(h // ELA_BLOCK, ELA_BLOCK, w // ELA_BLOCK, ELA_BLOCK).mean(axis=(1, 3))
+    return float(np.mean(blocks > ELA_BLOCK_ERROR))
 
 
 # ----------------------------------------------------------------------------
@@ -296,8 +335,8 @@ def analyze_document_fraud(file_bytes: bytes,
     ela_ok = anomaly <= ELA_ANOMALY_RATIO
     if not ela_ok:
         risk += 40
-        flags.append(f"ELA compression anomaly detected ({anomaly:.4f})")
-    layers["layer_2_pixel_ela"] = {"passed": ela_ok, "anomaly_score": round(anomaly, 4)}
+        flags.append(f"ELA: edited/pasted regions suspected ({anomaly*100:.2f}% of page blocks)")
+    layers["layer_2_pixel_ela"] = {"passed": ela_ok, "anomaly_score": round(anomaly, 5)}
 
     # ---- Layer 3A + 3B: AI vision -------------------------------------------
     clip = run_clip_classifier(page_img)
