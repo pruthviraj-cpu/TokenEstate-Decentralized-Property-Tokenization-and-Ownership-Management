@@ -15,8 +15,7 @@ import { Button } from '../../components/ui/Button';
 import { Input } from '../../components/ui/Input';
 import { Card } from '../../components/ui/Card';
 import { Select } from '../../components/ui/Select';
-
-const API_URL = 'http://localhost:8000/api/v1/auth';
+import { supabase } from '../../lib/supabase';
 
 export function SignupPage() {
   const navigate = useNavigate();
@@ -28,10 +27,12 @@ export function SignupPage() {
   const [showPassword, setShowPassword] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
 
   const handleSubmit = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     setError('');
+    setSuccess('');
 
     if (name.trim().length < 2) {
       setError('Please enter your full name.');
@@ -46,50 +47,33 @@ export function SignupPage() {
     setIsLoading(true);
 
     try {
-      const response = await fetch(`${API_URL}/register`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          username:
-            name.trim().replace(/\s+/g, '').toLowerCase() ||
-            email.split('@')[0],
-          full_name: name.trim(),
-          email: email.trim().toLowerCase(),
-          password,
-          role,
-        }),
+      const { data, error: signupError } = await supabase.auth.signUp({
+        email: email.trim().toLowerCase(),
+        password,
+        options: {
+          data: {
+            full_name: name.trim(),
+            role,
+          },
+        },
       });
 
-      const data = await response.json().catch(() => ({}));
-
-      if (!response.ok) {
-        const message = Array.isArray(data.detail)
-          ? data.detail.map((item: { msg?: string }) => item.msg).join(', ')
-          : data.detail;
-
-        throw new Error(message || 'Unable to create your account.');
+      if (signupError) {
+        throw signupError;
       }
 
-      if (data.access_token) {
-        localStorage.setItem('token', data.access_token);
-
-        if (data.user) {
-          localStorage.setItem('user', JSON.stringify(data.user));
-        }
-
-        navigate('/dashboard');
+      if (data.session) {
+        navigate('/dashboard', { replace: true });
       } else {
-        // Registration succeeded, but the API did not return a token.
-        // Send the user to login instead of assuming they are authenticated.
-        navigate('/login', {
-          state: { message: 'Account created. Please log in.' },
-        });
+        setSuccess(
+          'Account created! Please check your email to confirm your account, then log in.',
+        );
       }
     } catch (err) {
       setError(
         err instanceof Error
           ? err.message
-          : 'Network error. Please try again.',
+          : 'Unable to create your account. Please try again.',
       );
     } finally {
       setIsLoading(false);
@@ -119,6 +103,15 @@ export function SignupPage() {
             className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700"
           >
             {error}
+          </div>
+        )}
+
+        {success && (
+          <div
+            role="status"
+            className="rounded-lg border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700"
+          >
+            {success}
           </div>
         )}
 
@@ -238,4 +231,3 @@ export function SignupPage() {
     </div>
   );
 }
-
