@@ -40,7 +40,14 @@ export const TokenizationHubPage: React.FC = () => {
 
   useEffect(() => {
     loadProperties();
-    return propertyService.subscribe(loadProperties);
+    return propertyService.subscribe(() => {
+      const all = propertyService.getSharedProperties();
+      setProperties(all);
+      if (propertyId) {
+        const match = all.find(p => p.id === propertyId);
+        if (match) setSelectedProperty(match);
+      }
+    });
   }, [propertyId]);
 
   const eligibleList = properties.filter(p => p.status === 'verified' && !p.isTokenized);

@@ -52,8 +52,17 @@ export const PropertyDetailsPage: React.FC = () => {
 
   useEffect(() => {
     loadData();
-    const unsubProp = propertyService.subscribe(loadData);
-    const unsubAudit = auditService.subscribe(loadData);
+    const unsubProp = propertyService.subscribe(() => {
+      const found = propertyService.getSharedProperties().find(p => p.id === id);
+      if (found) {
+        setProperty(found);
+      }
+    });
+    const unsubAudit = auditService.subscribe(() => {
+      if (id) {
+        setEvents(auditService.getEventsByProperty(id));
+      }
+    });
     return () => {
       unsubProp();
       unsubAudit();

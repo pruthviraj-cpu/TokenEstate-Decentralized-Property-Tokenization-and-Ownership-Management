@@ -23,6 +23,7 @@ import samplePropertyImage from '../../assets/images/property_bengaluru_estate_1
 export const PropertiesListPage: React.FC = () => {
   const {
     getAllProperties,
+    getSharedProperties,
     loading: isPropertiesLoading,
     error: propertiesError,
     subscribe,
@@ -46,7 +47,7 @@ export const PropertiesListPage: React.FC = () => {
   useEffect(() => {
     load();
     const unsubscribe = subscribe(() => {
-      load(false);
+      setProperties(getSharedProperties());
     });
     return () => {
       unsubscribe();

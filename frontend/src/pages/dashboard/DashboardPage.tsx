@@ -79,10 +79,10 @@ export const DashboardPage: React.FC = () => {
   useEffect(() => {
     load();
     const unsubTrans = transferService.subscribe(() => {
-      load(false);
+      setTransfers(transferService.getAllTransfers());
     });
     const unsubAudit = auditService.subscribe(() => {
-      load(false);
+      setRecentAudits(auditService.getAllEvents().slice(0, 5));
     });
 
     return () => {

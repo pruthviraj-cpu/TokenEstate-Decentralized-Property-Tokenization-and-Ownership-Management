@@ -25,8 +25,11 @@ export type RegisterPropertyData = Omit<
 // ---------------------------------------------------------
 let sharedProperties: Property[] = [];
 let lastPropertiesFetchTime = 0;
+let lastPropertiesFetchErrorTime = 0;
 let inFlightPropertiesPromise: Promise<Property[]> | null = null;
+
 export const PROPERTIES_CACHE_TTL_MS = 60 * 1000; // 60 seconds
+export const ERROR_RETRY_COOLDOWN_MS = 6 * 1000; // 6 seconds backoff cooldown
 
 const listeners = new Set<() => void>();
 
@@ -37,19 +40,48 @@ export const subscribeProperties = (callback: () => void): (() => void) => {
   };
 };
 
-const notifyProperties = (): void => {
-  listeners.forEach((listener) => listener());
+export const notifyProperties = (): void => {
+  listeners.forEach((listener) => {
+    try {
+      listener();
+    } catch (e) {
+      console.error('[notifyProperties] Subscriber error:', e);
+    }
+  });
 };
+
+export const getSharedProperties = (): Property[] => [...sharedProperties];
 
 export const invalidatePropertiesCache = (): void => {
   lastPropertiesFetchTime = 0;
 };
 
-const updatePropertiesStore = (
+// READ CACHE UPDATE: Updates cache in-memory without notifying mutation subscribers
+export const setCachedProperties = (props: Property[]): Property[] => {
+  sharedProperties = props;
+  lastPropertiesFetchTime = Date.now();
+  lastPropertiesFetchErrorTime = 0;
+  return sharedProperties;
+};
+
+// CACHE SINGLE PROPERTY: Updates or inserts a single item in cache without notifying mutation subscribers
+export const cacheSingleProperty = (property: Property): Property => {
+  const index = sharedProperties.findIndex((item) => item.id === property.id);
+  if (index >= 0) {
+    sharedProperties[index] = property;
+  } else {
+    sharedProperties = [property, ...sharedProperties];
+  }
+  return property;
+};
+
+// MUTATION STORE UPDATE: Updates store and notifies all subscribers (only used on real data mutations)
+export const mutatePropertiesStore = (
   updater: (prev: Property[]) => Property[],
 ): Property[] => {
   sharedProperties = updater(sharedProperties);
   lastPropertiesFetchTime = Date.now();
+  lastPropertiesFetchErrorTime = 0;
   notifyProperties();
   return sharedProperties;
 };
@@ -184,371 +216,19 @@ export const mapProperty = (value: any): Property => {
 };
 
 // ---------------------------------------------------------
-// Custom React Hook: usePropertyService
-// ---------------------------------------------------------
-export function usePropertyService() {
-  const {
-    execute,
-    executeBlob,
-    data: rawData,
-    status,
-    err,
-  } = useManualFetch<any>();
-
-  const [properties, setProperties] = useState<Property[]>(
-    () => sharedProperties,
-  );
-
-  useEffect(() => {
-    const unsubscribe = subscribeProperties(() => {
-      setProperties([...sharedProperties]);
-    });
-    return unsubscribe;
-  }, []);
-
-  const getAllProperties = useCallback(
-    async (forceRefresh = false): Promise<Property[]> => {
-      const isCacheFresh =
-        Date.now() - lastPropertiesFetchTime < PROPERTIES_CACHE_TTL_MS;
-
-      if (!forceRefresh && sharedProperties.length > 0 && isCacheFresh) {
-        return [...sharedProperties];
-      }
-
-      if (inFlightPropertiesPromise) {
-        return inFlightPropertiesPromise;
-      }
-
-      inFlightPropertiesPromise = (async () => {
-        try {
-          const response = await execute(PROPERTY_ENDPOINT, 'GET');
-          const mapped = extractList(response).map(mapProperty);
-          updatePropertiesStore(() => mapped);
-          return mapped;
-        } finally {
-          inFlightPropertiesPromise = null;
-        }
-      })();
-
-      return inFlightPropertiesPromise;
-    },
-    [execute],
-  );
-
-  const getPropertyById = useCallback(
-    async (id: string): Promise<Property | null> => {
-      const response = await execute(
-        `${PROPERTY_ENDPOINT}/${encodeURIComponent(id)}`,
-        'GET',
-      );
-      const property = mapProperty(extractProperty(response));
-
-      updatePropertiesStore((prev) => {
-        const index = prev.findIndex((item) => item.id === property.id);
-        if (index >= 0) {
-          const updated = [...prev];
-          updated[index] = property;
-          return updated;
-        }
-        return [property, ...prev];
-      });
-
-      return property;
-    },
-    [execute],
-  );
-
-  const getPropertiesByOwner = useCallback(
-    async (ownerAddress: string): Promise<Property[]> => {
-      const all = await getAllProperties();
-      return all.filter(
-        (property) =>
-          property.currentOwnerAddress.toLowerCase() ===
-          ownerAddress.toLowerCase(),
-      );
-    },
-    [getAllProperties],
-  );
-
-  const getPendingProperties = useCallback(async (): Promise<Property[]> => {
-    const all = await getAllProperties();
-    return all.filter(
-      (property) => property.status === 'pending_verification',
-    );
-  }, [getAllProperties]);
-
-  const getMarketplaceProperties = useCallback(async (): Promise<
-    Property[]
-  > => {
-    const all = await getAllProperties();
-    return all.filter(
-      (property) =>
-        property.status === 'verified' ||
-        property.status === 'tokenized',
-    );
-  }, [getAllProperties]);
-
-  const registerProperty = useCallback(
-    async (
-      data: RegisterPropertyData,
-    ): Promise<{
-      property: Property;
-      txHash: string;
-      blockNumber: number;
-    }> => {
-      const payload = {
-        title: data.title,
-        survey_number: data.surveyNumber,
-        property_type: data.propertyType,
-        address: data.address,
-        city: data.city,
-        state: data.state,
-        district: data.district,
-        pin_code: data.pinCode,
-        area_sq_ft: data.areaSqFt,
-        land_type: data.landType,
-        latitude: data.coordinates?.lat,
-        longitude: data.coordinates?.lng,
-        current_owner_address: data.currentOwnerAddress,
-        ownership_type: data.ownershipType,
-        valuation_in_inr: data.valuationInINR,
-        valuation_in_matic: data.valuationInMATIC,
-      };
-
-      const response = await execute(PROPERTY_ENDPOINT, 'POST', payload);
-      const result = extractProperty(response);
-      const property = mapProperty(result);
-
-      const txHash = String(
-        response?.tx_hash ??
-          response?.txHash ??
-          result?.tx_hash ??
-          result?.txHash ??
-          '',
-      );
-
-      const blockNumber = Number(
-        response?.block_number ??
-          response?.blockNumber ??
-          result?.block_number ??
-          result?.blockNumber ??
-          0,
-      );
-
-      updatePropertiesStore((prev) => [
-        property,
-        ...prev.filter((item) => item.id !== property.id),
-      ]);
-
-      if (txHash) {
-        auditService.recordEvent({
-          propertyId: property.id,
-          eventType: 'PropertyRegistered',
-          actorAddress: property.currentOwnerAddress,
-          role: 'Owner',
-          blockNumber,
-          txHash,
-          details: `Property registration submitted for Survey ${property.surveyNumber} in ${property.city}.`,
-        });
-      }
-
-      return { property, txHash, blockNumber };
-    },
-    [execute],
-  );
-
-  const approveProperty = useCallback(
-    async (
-      id: string,
-      officerAddress: string,
-      notes?: string,
-    ): Promise<{ success: boolean; txHash: string }> => {
-      const response = await execute(
-        `${PROPERTY_ENDPOINT}/${encodeURIComponent(id)}/approve`,
-        'POST',
-        {
-          officer_address: officerAddress,
-          notes,
-        },
-      );
-
-      await getAllProperties(true);
-
-      return {
-        success: response?.success ?? true,
-        txHash: response?.tx_hash ?? response?.txHash ?? '',
-      };
-    },
-    [execute, getAllProperties],
-  );
-
-  const rejectProperty = useCallback(
-    async (
-      id: string,
-      officerAddress: string,
-      reason: string,
-    ): Promise<{ success: boolean; txHash: string }> => {
-      const response = await execute(
-        `${PROPERTY_ENDPOINT}/${encodeURIComponent(id)}/reject`,
-        'POST',
-        {
-          officer_address: officerAddress,
-          reason,
-        },
-      );
-
-      await getAllProperties(true);
-
-      return {
-        success: response?.success ?? true,
-        txHash: response?.tx_hash ?? response?.txHash ?? '',
-      };
-    },
-    [execute, getAllProperties],
-  );
-
-  const attachDocument = useCallback(
-    async (
-      propertyId: string,
-      doc: PropertyDocument,
-    ): Promise<void> => {
-      await execute(
-        `${PROPERTY_ENDPOINT}/${encodeURIComponent(propertyId)}/documents`,
-        'POST',
-        {
-          ...doc,
-          ipfs_cid: doc.ipfsCid,
-        },
-      );
-
-      await getAllProperties(true);
-    },
-    [execute, getAllProperties],
-  );
-
-  const tokenizeProperty = useCallback(
-    async (
-      propertyId: string,
-      ownerAddress: string,
-    ): Promise<{
-      tokenId: string;
-      txHash: string;
-      contractAddress: string;
-    }> => {
-      const response = await execute(
-        `${PROPERTY_ENDPOINT}/${encodeURIComponent(propertyId)}/tokenize`,
-        'POST',
-        {
-          owner_address: ownerAddress,
-        },
-      );
-
-      await getAllProperties(true);
-
-      const tokenId = String(
-        response?.token_id ?? response?.tokenId ?? '',
-      );
-
-      const txHash = String(
-        response?.tx_hash ?? response?.txHash ?? '',
-      );
-
-      const contractAddress = String(
-        response?.contract_address ??
-          response?.contractAddress ??
-          APP_CONFIG.contracts.propertyNFT,
-      );
-
-      if (!tokenId || !txHash) {
-        throw new Error(
-          'The backend did not return a token ID and transaction hash.',
-        );
-      }
-
-      return { tokenId, txHash, contractAddress };
-    },
-    [execute, getAllProperties],
-  );
-
-  const transferOwnership = useCallback(
-    async (
-      propertyId: string,
-      newOwnerAddress: string,
-      transferTxHash: string,
-    ): Promise<void> => {
-      await execute(
-        `${PROPERTY_ENDPOINT}/${encodeURIComponent(propertyId)}/transfer`,
-        'POST',
-        {
-          new_owner_address: newOwnerAddress,
-          transaction_hash: transferTxHash,
-        },
-      );
-
-      await getAllProperties(true);
-    },
-    [execute, getAllProperties],
-  );
-
-  const getFraudReport = useCallback(
-    (propertyId: string): FraudCheckReport => {
-      if (FRAUD_CHECKS[propertyId]) {
-        return FRAUD_CHECKS[propertyId];
-      }
-
-      const prop = sharedProperties.find((item) => item.id === propertyId);
-
-      return {
-        propertyId,
-        surveyNumber: prop?.surveyNumber ?? 'N/A',
-        isUniquePropertyId: true,
-        isUniqueSurveyNumber: true,
-        ownerWalletValid: Boolean(prop?.currentOwnerAddress),
-        documentsVerified:
-          prop?.status === 'verified' || prop?.status === 'tokenized',
-        previousOwnershipClean: true,
-        nftUnique: true,
-        conflictDetected: false,
-        lastAudited: new Date().toISOString(),
-      };
-    },
-    [],
-  );
-
-  return {
-    properties,
-    status,
-    loading: status === 'loading',
-    error: err,
-    data: rawData,
-    execute,
-    executeBlob,
-    subscribe: subscribeProperties,
-    invalidateCache: invalidatePropertiesCache,
-    mapProperty,
-    extractList,
-    extractProperty,
-    getAllProperties,
-    getPropertyById,
-    getPropertiesByOwner,
-    getPendingProperties,
-    getMarketplaceProperties,
-    registerProperty,
-    approveProperty,
-    rejectProperty,
-    attachDocument,
-    tokenizeProperty,
-    transferOwnership,
-    getFraudReport,
-  };
-}
-
-// ---------------------------------------------------------
-// PropertyService Class (Preserved for non-hook callers / compatibility)
+// PropertyService Class (Single Source of Truth)
 // ---------------------------------------------------------
 export class PropertyService {
   public subscribe(callback: () => void): () => void {
     return subscribeProperties(callback);
+  }
+
+  public getSharedProperties(): Property[] {
+    return getSharedProperties();
+  }
+
+  public invalidateCache(): void {
+    invalidatePropertiesCache();
   }
 
   public extractList(response: any): any[] {
@@ -565,12 +245,24 @@ export class PropertyService {
 
   public async getAllProperties(forceRefresh = false): Promise<Property[]> {
     const isCacheFresh =
+      lastPropertiesFetchTime > 0 &&
       Date.now() - lastPropertiesFetchTime < PROPERTIES_CACHE_TTL_MS;
 
-    if (!forceRefresh && sharedProperties.length > 0 && isCacheFresh) {
+    // Cache hit: immediately return cached copy with zero network overhead
+    if (!forceRefresh && isCacheFresh) {
       return [...sharedProperties];
     }
 
+    // Cooldown check: prevent tight loops on persistent backend failures
+    if (
+      !forceRefresh &&
+      lastPropertiesFetchErrorTime > 0 &&
+      Date.now() - lastPropertiesFetchErrorTime < ERROR_RETRY_COOLDOWN_MS
+    ) {
+      return [...sharedProperties];
+    }
+
+    // In-flight deduplication: return the shared active promise to collapse concurrent requests
     if (inFlightPropertiesPromise) {
       return inFlightPropertiesPromise;
     }
@@ -583,8 +275,15 @@ export class PropertyService {
         });
 
         const mapped = extractList(response).map(mapProperty);
-        updatePropertiesStore(() => mapped);
+        setCachedProperties(mapped);
         return [...sharedProperties];
+      } catch (err) {
+        lastPropertiesFetchErrorTime = Date.now();
+        console.warn('[PropertyService] getAllProperties fetch failed:', err);
+        if (sharedProperties.length > 0) {
+          return [...sharedProperties];
+        }
+        throw err;
       } finally {
         inFlightPropertiesPromise = null;
       }
@@ -593,34 +292,35 @@ export class PropertyService {
     return inFlightPropertiesPromise;
   }
 
-  public async getPropertyById(
-    id: string,
-  ): Promise<Property | null> {
-    const response = await apiRequest<any>({
-      endpoint: `${PROPERTY_ENDPOINT}/${encodeURIComponent(id)}`,
-      method: 'GET',
-    });
+  public async getPropertyById(id: string): Promise<Property | null> {
+    const cached = sharedProperties.find((item) => item.id === id);
+    const isCacheFresh =
+      lastPropertiesFetchTime > 0 &&
+      Date.now() - lastPropertiesFetchTime < PROPERTIES_CACHE_TTL_MS;
 
-    const property = mapProperty(extractProperty(response));
+    if (cached && isCacheFresh) {
+      return cached;
+    }
 
-    updatePropertiesStore((prev) => {
-      const index = prev.findIndex((item) => item.id === property.id);
-      if (index >= 0) {
-        const updated = [...prev];
-        updated[index] = property;
-        return updated;
-      }
-      return [property, ...prev];
-    });
+    try {
+      const response = await apiRequest<any>({
+        endpoint: `${PROPERTY_ENDPOINT}/${encodeURIComponent(id)}`,
+        method: 'GET',
+      });
 
-    return property;
+      const property = mapProperty(extractProperty(response));
+      cacheSingleProperty(property);
+      return property;
+    } catch (err) {
+      if (cached) return cached;
+      throw err;
+    }
   }
 
   public async getPropertiesByOwner(
     ownerAddress: string,
   ): Promise<Property[]> {
     const properties = await this.getAllProperties();
-
     return properties.filter(
       (property) =>
         property.currentOwnerAddress.toLowerCase() ===
@@ -630,7 +330,6 @@ export class PropertyService {
 
   public async getPendingProperties(): Promise<Property[]> {
     const properties = await this.getAllProperties();
-
     return properties.filter(
       (property) => property.status === 'pending_verification',
     );
@@ -638,7 +337,6 @@ export class PropertyService {
 
   public async getMarketplaceProperties(): Promise<Property[]> {
     const properties = await this.getAllProperties();
-
     return properties.filter(
       (property) =>
         property.status === 'verified' ||
@@ -697,7 +395,7 @@ export class PropertyService {
         0,
     );
 
-    updatePropertiesStore((prev) => [
+    mutatePropertiesStore((prev) => [
       property,
       ...prev.filter((item) => item.id !== property.id),
     ]);
@@ -731,11 +429,27 @@ export class PropertyService {
       },
     });
 
-    await this.getAllProperties();
+    const txHash = response?.tx_hash ?? response?.txHash ?? '';
+
+    mutatePropertiesStore((prev) =>
+      prev.map((item) =>
+        item.id === id ? { ...item, status: 'verified' as const } : item,
+      ),
+    );
+
+    auditService.recordEvent({
+      propertyId: id,
+      eventType: 'PropertyApproved',
+      actorAddress: officerAddress,
+      role: 'Government Registrar',
+      blockNumber: Number(response?.block_number ?? 0),
+      txHash: String(txHash),
+      details: `Property title confirmed and approved for tokenization. Notes: ${notes || 'Verified against revenue records'}`,
+    });
 
     return {
       success: response?.success ?? true,
-      txHash: response?.tx_hash ?? response?.txHash ?? '',
+      txHash: String(txHash),
     };
   }
 
@@ -753,11 +467,27 @@ export class PropertyService {
       },
     });
 
-    await this.getAllProperties();
+    const txHash = response?.tx_hash ?? response?.txHash ?? '';
+
+    mutatePropertiesStore((prev) =>
+      prev.map((item) =>
+        item.id === id ? { ...item, status: 'rejected' as const } : item,
+      ),
+    );
+
+    auditService.recordEvent({
+      propertyId: id,
+      eventType: 'PropertyRejected',
+      actorAddress: officerAddress,
+      role: 'Government Registrar',
+      blockNumber: Number(response?.block_number ?? 0),
+      txHash: String(txHash),
+      details: `Property registration rejected: ${reason}`,
+    });
 
     return {
       success: response?.success ?? true,
-      txHash: response?.tx_hash ?? response?.txHash ?? '',
+      txHash: String(txHash),
     };
   }
 
@@ -774,7 +504,23 @@ export class PropertyService {
       },
     });
 
-    await this.getAllProperties();
+    mutatePropertiesStore((prev) =>
+      prev.map((item) =>
+        item.id === propertyId
+          ? { ...item, documents: [...(item.documents || []), doc] }
+          : item,
+      ),
+    );
+
+    auditService.recordEvent({
+      propertyId,
+      eventType: 'DocumentAdded',
+      actorAddress: doc.verifiedBy || '0x0000000000000000000000000000000000000000',
+      role: 'Owner',
+      blockNumber: 0,
+      txHash: '',
+      details: `Instrument ${doc.name} (${doc.type}) attached with IPFS CID ${doc.ipfsCid}`,
+    });
   }
 
   public async tokenizeProperty(
@@ -792,8 +538,6 @@ export class PropertyService {
         owner_address: ownerAddress,
       },
     });
-
-    await this.getAllProperties();
 
     const tokenId = String(
       response?.token_id ?? response?.tokenId ?? '',
@@ -815,6 +559,31 @@ export class PropertyService {
       );
     }
 
+    mutatePropertiesStore((prev) =>
+      prev.map((item) =>
+        item.id === propertyId
+          ? {
+              ...item,
+              status: 'tokenized' as const,
+              isTokenized: true,
+              tokenId,
+              tokenContract: contractAddress,
+              mintTxHash: txHash,
+            }
+          : item,
+      ),
+    );
+
+    auditService.recordEvent({
+      propertyId,
+      eventType: 'NFTMinted',
+      actorAddress: ownerAddress,
+      role: 'Owner',
+      blockNumber: Number(response?.block_number ?? 0),
+      txHash,
+      details: `ERC-721 Token #${tokenId} minted to ${ownerAddress} on contract ${contractAddress}`,
+    });
+
     return { tokenId, txHash, contractAddress };
   }
 
@@ -832,7 +601,23 @@ export class PropertyService {
       },
     });
 
-    await this.getAllProperties();
+    mutatePropertiesStore((prev) =>
+      prev.map((item) =>
+        item.id === propertyId
+          ? { ...item, currentOwnerAddress: newOwnerAddress }
+          : item,
+      ),
+    );
+
+    auditService.recordEvent({
+      propertyId,
+      eventType: 'TransferCompleted',
+      actorAddress: newOwnerAddress,
+      role: 'Buyer',
+      blockNumber: 0,
+      txHash: transferTxHash,
+      details: `Title conveyed to ${newOwnerAddress}. TxHash: ${transferTxHash}`,
+    });
   }
 
   public getFraudReport(propertyId: string): FraudCheckReport {
@@ -860,3 +645,219 @@ export class PropertyService {
 }
 
 export const propertyService = new PropertyService();
+
+// ---------------------------------------------------------
+// Custom React Hook: usePropertyService
+// ---------------------------------------------------------
+export function usePropertyService() {
+  const { execute, executeBlob } = useManualFetch<any>();
+
+  const [properties, setProperties] = useState<Property[]>(
+    () => sharedProperties,
+  );
+  const [loading, setLoading] = useState<boolean>(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    // Synchronize local hook state whenever a real mutation occurs
+    const unsubscribe = subscribeProperties(() => {
+      setProperties([...sharedProperties]);
+    });
+    return unsubscribe;
+  }, []);
+
+  const getAllProperties = useCallback(
+    async (forceRefresh = false): Promise<Property[]> => {
+      const isCacheFresh =
+        lastPropertiesFetchTime > 0 &&
+        Date.now() - lastPropertiesFetchTime < PROPERTIES_CACHE_TTL_MS;
+
+      // Cache hit: instant return without triggering loading state toggles
+      if (!forceRefresh && isCacheFresh) {
+        setProperties([...sharedProperties]);
+        return [...sharedProperties];
+      }
+
+      setLoading(true);
+      setError(null);
+      try {
+        const data = await propertyService.getAllProperties(forceRefresh);
+        setProperties(data);
+        return data;
+      } catch (err: any) {
+        const msg = err?.message || 'Failed to fetch properties';
+        setError(msg);
+        throw err;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [],
+  );
+
+  const getPropertyById = useCallback(
+    async (id: string): Promise<Property | null> => {
+      return propertyService.getPropertyById(id);
+    },
+    [],
+  );
+
+  const getPropertiesByOwner = useCallback(
+    async (ownerAddress: string): Promise<Property[]> => {
+      return propertyService.getPropertiesByOwner(ownerAddress);
+    },
+    [],
+  );
+
+  const getPendingProperties = useCallback(async (): Promise<Property[]> => {
+    return propertyService.getPendingProperties();
+  }, []);
+
+  const getMarketplaceProperties = useCallback(async (): Promise<Property[]> => {
+    return propertyService.getMarketplaceProperties();
+  }, []);
+
+  const registerProperty = useCallback(
+    async (data: RegisterPropertyData) => {
+      setLoading(true);
+      setError(null);
+      try {
+        const res = await propertyService.registerProperty(data);
+        setProperties([...sharedProperties]);
+        return res;
+      } catch (err: any) {
+        const msg = err?.message || 'Registration failed';
+        setError(msg);
+        throw err;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [],
+  );
+
+  const approveProperty = useCallback(
+    async (id: string, officerAddress: string, notes?: string) => {
+      setLoading(true);
+      setError(null);
+      try {
+        const res = await propertyService.approveProperty(id, officerAddress, notes);
+        setProperties([...sharedProperties]);
+        return res;
+      } catch (err: any) {
+        const msg = err?.message || 'Approval failed';
+        setError(msg);
+        throw err;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [],
+  );
+
+  const rejectProperty = useCallback(
+    async (id: string, officerAddress: string, reason: string) => {
+      setLoading(true);
+      setError(null);
+      try {
+        const res = await propertyService.rejectProperty(id, officerAddress, reason);
+        setProperties([...sharedProperties]);
+        return res;
+      } catch (err: any) {
+        const msg = err?.message || 'Rejection failed';
+        setError(msg);
+        throw err;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [],
+  );
+
+  const attachDocument = useCallback(
+    async (propertyId: string, doc: PropertyDocument) => {
+      setLoading(true);
+      setError(null);
+      try {
+        await propertyService.attachDocument(propertyId, doc);
+        setProperties([...sharedProperties]);
+      } catch (err: any) {
+        const msg = err?.message || 'Attach document failed';
+        setError(msg);
+        throw err;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [],
+  );
+
+  const tokenizeProperty = useCallback(
+    async (propertyId: string, ownerAddress: string) => {
+      setLoading(true);
+      setError(null);
+      try {
+        const res = await propertyService.tokenizeProperty(propertyId, ownerAddress);
+        setProperties([...sharedProperties]);
+        return res;
+      } catch (err: any) {
+        const msg = err?.message || 'Tokenization failed';
+        setError(msg);
+        throw err;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [],
+  );
+
+  const transferOwnership = useCallback(
+    async (propertyId: string, newOwnerAddress: string, transferTxHash: string) => {
+      setLoading(true);
+      setError(null);
+      try {
+        await propertyService.transferOwnership(propertyId, newOwnerAddress, transferTxHash);
+        setProperties([...sharedProperties]);
+      } catch (err: any) {
+        const msg = err?.message || 'Transfer failed';
+        setError(msg);
+        throw err;
+      } finally {
+        setLoading(false);
+      }
+    },
+    [],
+  );
+
+  const getFraudReport = useCallback((propertyId: string): FraudCheckReport => {
+    return propertyService.getFraudReport(propertyId);
+  }, []);
+
+  return {
+    properties,
+    status: loading ? 'loading' : error ? 'error' : 'idle',
+    loading,
+    error,
+    data: properties,
+    execute,
+    executeBlob,
+    subscribe: subscribeProperties,
+    getSharedProperties,
+    invalidateCache: invalidatePropertiesCache,
+    mapProperty,
+    extractList,
+    extractProperty,
+    getAllProperties,
+    getPropertyById,
+    getPropertiesByOwner,
+    getPendingProperties,
+    getMarketplaceProperties,
+    registerProperty,
+    approveProperty,
+    rejectProperty,
+    attachDocument,
+    tokenizeProperty,
+    transferOwnership,
+    getFraudReport,
+  };
+}

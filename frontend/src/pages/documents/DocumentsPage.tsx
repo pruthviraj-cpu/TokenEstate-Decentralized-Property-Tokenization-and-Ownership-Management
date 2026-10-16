@@ -23,8 +23,8 @@ export const DocumentsPage: React.FC = () => {
   const [searchTerm, setSearchTerm] = useState('');
 
   useEffect(() => {
-    const load = async () => {
-      const props = await propertyService.getAllProperties();
+    const syncFromStore = () => {
+      const props = propertyService.getSharedProperties();
       const list: FlattenedDoc[] = [];
       props.forEach(p => {
         p.documents.forEach(d => {
@@ -39,8 +39,8 @@ export const DocumentsPage: React.FC = () => {
       setDocs(list);
     };
 
-    load();
-    return propertyService.subscribe(load);
+    propertyService.getAllProperties().then(syncFromStore).catch(() => {});
+    return propertyService.subscribe(syncFromStore);
   }, []);
 
   const filtered = docs.filter(d => {

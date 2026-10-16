@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import { apiRequest } from "../services/api";
 
 type Status = "idle" | "loading" | "success" | "error";
@@ -8,7 +8,7 @@ const useManualFetch = <T>() => {
     const [status, setStatus] = useState<Status>("idle");
     const [err, setErr] = useState<string | null>(null);
 
-    const execute = async (
+    const execute = useCallback(async (
         endpoint: string,
         method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE",
         body?: FormData | object | null
@@ -38,9 +38,9 @@ const useManualFetch = <T>() => {
 
             throw err;
         }
-    };
+    }, []);
 
-    const executeBlob = async (
+    const executeBlob = useCallback(async (
         endpoint: string,
         method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE",
         body?: FormData | object | null
@@ -70,7 +70,7 @@ const useManualFetch = <T>() => {
 
             throw err;
         }
-    };
+    }, []);
 
     return {
         execute,

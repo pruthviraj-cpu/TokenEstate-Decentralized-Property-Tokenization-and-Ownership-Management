@@ -59,6 +59,10 @@ export interface Property {
   tokenId?: string;
   tokenContract?: string;
   mintTxHash?: string;
+  metadata_hash?: string;
+  blockchain_property_id?: string;
+  transaction_hash?: string;
+  contract_address?: string;
   image: string;
   documents: PropertyDocument[];
 }

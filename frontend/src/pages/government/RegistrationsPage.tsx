@@ -17,14 +17,16 @@ export const GovernmentRegistrationsPage: React.FC = () => {
   const [selectedToApprove, setSelectedToApprove] = useState<Property | null>(null);
   const [isApproving, setIsApproving] = useState(false);
 
-  const loadData = async () => {
-    const all = await propertyService.getAllProperties();
+  const loadData = async (force = false) => {
+    const all = await propertyService.getAllProperties(force);
     setProperties(all);
   };
 
   useEffect(() => {
     loadData();
-    return propertyService.subscribe(loadData);
+    return propertyService.subscribe(() => {
+      setProperties(propertyService.getSharedProperties());
+    });
   }, []);
 
   const displayed = pendingOnly
